@@ -815,6 +815,11 @@ class Controller(ServerBase):
         with urllib.request.urlopen("https://ntp1node.nebl.io:8080/v3/addressinfo/"+address) as url:
             data = json.loads(url.read().decode())
             self.logger.info(data)
+        for utxo in data.utxos:
+        	if len(utxo.tokens) > 0:
+        		self.logger.error('ERROR: NTP1 Tokens found at address '+address)
+        		return []
+        self.logger.info('No NTP1 Tokens found at address '+address)
         hashX = self.address_to_hashX(address)
         return await self.hashX_listunspent(hashX)
 
