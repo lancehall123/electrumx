@@ -799,6 +799,7 @@ class Controller(ServerBase):
     async def hashX_listunspent(self, hashX):
         '''Return the list of UTXOs of a script hash, including mempool
         effects.'''
+        self.logger.info(hashX)
         utxos = await self.get_utxos(hashX)
         utxos = sorted(utxos)
         utxos.extend(self.mempool.get_utxos(hashX))
