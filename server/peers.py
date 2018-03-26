@@ -7,7 +7,6 @@
 
 '''Peer management.'''
 
-import ast
 import asyncio
 import random
 import socket
@@ -16,35 +15,17 @@ import time
 from collections import defaultdict, Counter
 from functools import partial
 
+import aiorpcx
+
 from lib.jsonrpc import JSONSession
 from lib.peer import Peer
-from lib.socks import SocksProxy
 import lib.util as util
-from server.irc import IRC
 import server.version as version
 
 
-PEERS_FILE = 'peers'
 PEER_GOOD, PEER_STALE, PEER_NEVER, PEER_BAD = range(4)
 STALE_SECS = 24 * 3600
 WAKEUP_SECS = 300
-
-
-def peers_from_env(env):
-    '''Return a list of peers from the environment settings.'''
-    hosts = {identity.host: {'tcp_port': identity.tcp_port,
-                             'ssl_port': identity.ssl_port}
-             for identity in env.identities}
-    features = {
-        'hosts': hosts,
-        'pruning': None,
-        'server_version': version.VERSION,
-        'protocol_min': version.PROTOCOL_MIN,
-        'protocol_max': version.PROTOCOL_MAX,
-        'genesis_hash': env.coin.GENESIS_HASH,
-    }
-
-    return [Peer(ident.host, features, 'env') for ident in env.identities]
 
 
 class PeerSession(JSONSession):
@@ -175,9 +156,13 @@ class PeerSession(JSONSession):
         if error:
             self.failed = True
             self.log_error('server.version returned an error')
-        elif isinstance(result, str):
-            self.peer.server_version = result
-            self.peer.features['server_version'] = result
+        else:
+            # Protocol version 1.1 returns a pair with the version first
+            if isinstance(result, list) and len(result) == 2:
+                result = result[0]
+            if isinstance(result, str):
+                self.peer.server_version = result
+                self.peer.features['server_version'] = result
         self.close_if_done()
 
     def check_remote_peers(self):
@@ -243,22 +228,19 @@ class PeerManager(util.LoggedClass):
         self.env = env
         self.controller = controller
         self.loop = controller.loop
-        if env.irc and env.coin.IRC_PREFIX:
-            self.irc = IRC(env, self)
-        else:
-            self.irc = None
-        self.myselves = peers_from_env(env)
+
+        # Our clearnet and Tor Peers, if any
+        self.myselves =  [Peer(ident.host, env.server_features(), 'env')
+                          for ident in env.identities]
         self.retry_event = asyncio.Event()
         # Peers have one entry per hostname.  Once connected, the
         # ip_addr property is either None, an onion peer, or the
         # IP address that was connected to.  Adding a peer will evict
         # any other peers with the same host name or IP address.
         self.peers = set()
-        self.onion_peers = []
         self.permit_onion_peer_time = time.time()
-        self.proxy = SocksProxy(env.tor_proxy_host, env.tor_proxy_port,
-                                loop=self.loop)
-        self.import_peers()
+        self.proxy = None
+        self.last_proxy_try = 0
 
     def my_clearnet_peer(self):
         '''Returns the clearnet peer representing this server, if any.'''
@@ -412,7 +394,6 @@ class PeerManager(util.LoggedClass):
             peers.update(bucket_peers[:2])
 
         # Add up to 20% onion peers (but up to 10 is OK anyway)
-        onion_peers = onion_peers or self.onion_peers
         random.shuffle(onion_peers)
         max_onion = 50 if is_tor else max(10, len(peers) // 4)
 
@@ -420,71 +401,49 @@ class PeerManager(util.LoggedClass):
 
         return [peer.to_tuple() for peer in peers]
 
-    def serialize(self):
-        serialized_peers = [peer.serialize() for peer in self.peers
-                            if not peer.bad]
-        data = (1, serialized_peers)  # version 1
-        return repr(data)
-
-    def write_peers_file(self):
-        with util.open_truncate(PEERS_FILE) as f:
-            f.write(self.serialize().encode())
-        self.logger.info('wrote out {:,d} peers'.format(len(self.peers)))
-
-    def read_peers_file(self):
-        try:
-            with util.open_file(PEERS_FILE, create=True) as f:
-                data = f.read(-1).decode()
-        except Exception as e:
-            self.logger.error('error reading peers file {}'.format(e))
-        else:
-            if data:
-                version, items = ast.literal_eval(data)
-                if version == 1:
-                    peers = []
-                    for item in items:
-                        if 'last_connect' in item:
-                            item['last_good'] = item.pop('last_connect')
-                        try:
-                            peers.append(Peer.deserialize(item))
-                        except Exception:
-                            pass
-                    self.add_peers(peers, source='peers file', limit=None)
-
     def import_peers(self):
         '''Import hard-coded peers from a file or the coin defaults.'''
         self.add_peers(self.myselves)
-        coin_peers = self.env.coin.PEERS
-        self.onion_peers = [Peer.from_real_name(rn, 'coins.py')
-                            for rn in coin_peers if '.onion ' in rn]
 
-        # If we don't have many peers in the peers file, add
-        # hard-coded ones
-        self.read_peers_file()
-        if len(self.peers) < 5:
+        # Add the hard-coded ones unless only returning self
+        if self.env.peer_discovery != self.env.PD_SELF:
+            coin_peers = self.env.coin.PEERS
             peers = [Peer.from_real_name(real_name, 'coins.py')
                      for real_name in coin_peers]
             self.add_peers(peers, limit=None)
 
-    def connect_to_irc(self):
-        '''Connect to IRC if not disabled.'''
-        if self.irc:
-            pairs = [(peer.real_name(), ident.nick_suffix) for peer, ident
-                     in zip(self.myselves, self.env.identities)]
-            self.ensure_future(self.irc.start(pairs))
-        elif self.env.irc:
-            self.logger.info('IRC is disabled for this coin')
-        else:
-            self.logger.info('IRC is disabled')
-
-    def add_irc_peer(self, nick, real_name):
-        '''Add an IRC peer.'''
-        peer = Peer.from_real_name(real_name, '{}'.format(nick))
-        self.add_peers([peer])
-
     def ensure_future(self, coro, callback=None):
         '''Schedule the coro to be run.'''
         return self.controller.ensure_future(coro, callback=callback)
+
+    async def maybe_detect_proxy(self):
+        '''Detect a proxy if we don't have one and some time has passed since
+        the last attempt.
+
+        If found self.proxy is set to an aiorpcX.SOCKSProxy instance,
+        otherwise None.
+        '''
+        if self.proxy or time.time() - self.last_proxy_try < 900:
+            return
+        self.last_proxy_try = time.time()
+
+        host = self.env.tor_proxy_host
+        if self.env.tor_proxy_port is None:
+            ports = [9050, 9150, 1080]
+        else:
+            ports = [self.env.tor_proxy_port]
+        self.log_info(f'trying to detect proxy on "{host}" ports {ports}')
+
+        cls = aiorpcx.SOCKSProxy
+        result = await cls.auto_detect_host(host, ports, None, loop=self.loop)
+        if isinstance(result, cls):
+            self.proxy = result
+            self.log_info(f'detected {self.proxy}')
+
+    def proxy_peername(self):
+        '''Return the peername of the proxy, if there is a proxy, otherwise
+        None.'''
+        return self.proxy.peername if self.proxy else None
 
     async def main_loop(self):
         '''Main loop performing peer maintenance.  This includes
@@ -493,29 +452,22 @@ class PeerManager(util.LoggedClass):
           2) Verifying connectivity of new peers.
           3) Retrying old peers at regular intervals.
         '''
-        self.connect_to_irc()
-        if not self.env.peer_discovery:
+        if self.env.peer_discovery != self.env.PD_ON:
             self.logger.info('peer discovery is disabled')
             return
 
-        # Wait a few seconds after starting the proxy detection loop
-        # for proxy detection to succeed
-        self.ensure_future(self.proxy.auto_detect_loop())
-        await self.proxy.tried_event.wait()
-
-        self.logger.info('beginning peer discovery; force use of proxy: {}'
+        self.logger.info('beginning peer discovery. Force use of proxy: {}'
                          .format(self.env.force_proxy))
 
-        try:
-            while True:
-                timeout = self.loop.call_later(WAKEUP_SECS,
-                                               self.retry_event.set)
-                await self.retry_event.wait()
-                self.retry_event.clear()
-                timeout.cancel()
-                await self.retry_peers()
-        finally:
-            self.write_peers_file()
+        self.import_peers()
+        await self.maybe_detect_proxy()
+
+        while True:
+            timeout = self.loop.call_later(WAKEUP_SECS, self.retry_event.set)
+            await self.retry_event.wait()
+            self.retry_event.clear()
+            timeout.cancel()
+            await self.retry_peers()
 
     def is_coin_onion_peer(self, peer):
         '''Return true if this peer is a hard-coded onion peer.'''
@@ -540,6 +492,9 @@ class PeerManager(util.LoggedClass):
 
         peers = [peer for peer in self.peers if should_retry(peer)]
 
+        if self.env.force_proxy or any(peer.is_tor for peer in peers):
+            await self.maybe_detect_proxy()
+
         for peer in peers:
             peer.try_count += 1
             pairs = peer.connection_port_pairs()
@@ -553,19 +508,25 @@ class PeerManager(util.LoggedClass):
         kind, port = port_pairs[0]
         sslc = ssl.SSLContext(ssl.PROTOCOL_TLS) if kind == 'SSL' else None
 
+        host = self.env.cs_host(for_rpc=False)
+        if isinstance(host, list):
+            host = host[0]
+
+        kwargs = {'ssl': sslc}
         if self.env.force_proxy or peer.is_tor:
-            # Only attempt a proxy connection if the proxy is up
-            if not self.proxy.is_up():
+            # Only attempt a proxy connection if we have one
+            if not self.proxy:
                 return
             create_connection = self.proxy.create_connection
         else:
             create_connection = self.loop.create_connection
-
-        local_addr = (self.env.host, None) if self.env.host else None
+            # Use our listening Host/IP for outgoing connections so
+            # our peers see the correct source.
+            if host:
+                kwargs['local_addr'] = (host, None)
 
         protocol_factory = partial(PeerSession, peer, self, kind)
-        coro = create_connection(protocol_factory, peer.host, port, ssl=sslc,
-                                 local_addr=local_addr)
+        coro = create_connection(protocol_factory, peer.host, port, **kwargs)
         callback = partial(self.connection_done, peer, port_pairs)
         self.ensure_future(coro, callback)
 

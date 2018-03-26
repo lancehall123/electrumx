@@ -19,7 +19,7 @@ from collections import namedtuple
 import lib.util as util
 from lib.hash import hash_to_str
 from server.storage import db_class
-from server.version import VERSION
+from server.version import VERSION, PROTOCOL_MIN, PROTOCOL_MAX
 
 
 UTXO = namedtuple("UTXO", "tx_num tx_pos tx_hash height value")
@@ -32,7 +32,7 @@ class DB(util.LoggedClass):
     it was shutdown uncleanly.
     '''
 
-    DB_VERSIONS = [5]
+    DB_VERSIONS = [6]
 
     class MissingUTXOError(Exception):
         '''Raised if a mempool tx input UTXO couldn't be found.'''
@@ -95,7 +95,7 @@ class DB(util.LoggedClass):
         '''Open the databases.  If already open they are closed and re-opened.
 
         When syncing we want to reserve a lot of open files for the
-        synchtonization.  When serving clients we want the open files for
+        synchronization.  When serving clients we want the open files for
         serving network connections.
         '''
         def log_reason(message, is_for_sync):
@@ -131,6 +131,8 @@ class DB(util.LoggedClass):
         self.read_history_state()
 
         self.logger.info('software version: {}'.format(VERSION))
+        self.logger.info('supported protocol versions: {}-{}'
+                         .format(PROTOCOL_MIN, PROTOCOL_MAX))
         self.logger.info('DB version: {:d}'.format(self.db_version))
         self.logger.info('coin: {}'.format(self.coin.NAME))
         self.logger.info('network: {}'.format(self.coin.NET))
@@ -209,18 +211,25 @@ class DB(util.LoggedClass):
         offset = prior_tx_count * 32
         self.hashes_file.write(offset, hashes)
 
-    def read_headers(self, start, count):
-        '''Requires count >= 0.'''
+    def read_headers(self, start_height, count):
+        '''Requires start_height >= 0, count >= 0.  Reads as many headers as
+        are available starting at start_height up to count.  This
+        would be zero if start_height is beyond self.db_height, for
+        example.
+
+        Returns a (binary, n) pair where binary is the concatenated
+        binary headers, and n is the count of headers returned.
+        '''
         # Read some from disk
-        disk_count = min(count, self.db_height + 1 - start)
-        if start < 0 or count < 0 or disk_count != count:
+        if start_height < 0 or count < 0:
             raise self.DBError('{:,d} headers starting at {:,d} not on disk'
-                               .format(count, start))
+                               .format(count, start_height))
+        disk_count = max(0, min(count, self.db_height + 1 - start_height))
         if disk_count:
-            offset = self.header_offset(start)
-            size = self.header_offset(start + disk_count) - offset
-            return self.headers_file.read(offset, size)
-        return b''
+            offset = self.header_offset(start_height)
+            size = self.header_offset(start_height + disk_count) - offset
+            return self.headers_file.read(offset, size), disk_count
+        return b'', 0
 
     def fs_tx_hash(self, tx_num):
         '''Return a par (tx_hash, tx_height) for the given tx number.
@@ -234,7 +243,10 @@ class DB(util.LoggedClass):
         return tx_hash, tx_height
 
     def fs_block_hashes(self, height, count):
-        headers_concat = self.read_headers(height, count)
+        headers_concat, headers_count = self.read_headers(height, count)
+        if headers_count != count:
+            raise self.DBError('only got {:,d} headers starting at {:,d}, not '
+                               '{:,d}'.format(headers_count, start, count))
         offset = 0
         headers = []
         for n in range(count):
@@ -662,7 +674,7 @@ class DB(util.LoggedClass):
         while self.comp_cursor != -1:
             if self.semaphore.locked:
                 self.log_info('compact_history: waiting on semaphore...')
-            with await self.semaphore:
+            async with self.semaphore:
                 await loop.run_in_executor(None, self._compact_history, limit)
 
     def cancel_history_compaction(self):

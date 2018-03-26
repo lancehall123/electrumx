@@ -6,11 +6,12 @@ setuptools.setup(
     name='electrumx',
     version=VERSION.split()[-1],
     scripts=['electrumx_server.py', 'electrumx_rpc.py'],
-    python_requires='>=3.5.3',
-    # "irc" package is only required if IRC connectivity is enabled
+    python_requires='>=3.6',
     # via environment variables, in which case I've tested with 15.0.4
     # "x11_hash" package (1.4) is required to sync DASH network.
-    install_requires=['plyvel', 'pylru', 'irc', 'aiohttp >= 1'],
+    # "tribus_hash" package is required to sync Denarius network.
+    # "blake256" package is required to sync Decred network.
+    install_requires=['aiorpcX >= 0.4.4', 'plyvel', 'pylru', 'aiohttp >= 1'],
     packages=setuptools.find_packages(exclude=['tests']),
     description='ElectrumX Server',
     author='Neil Booth',
@@ -19,9 +20,11 @@ setuptools.setup(
     url='https://github.com/kyuupichan/electrumx/',
     long_description='Server implementation for the Electrum wallet',
     classifiers=[
-        'Development Status :: 3 - Alpha',
+        'Development Status :: 5 - Production/Stable',
+        'Framework :: AsyncIO',
         'Topic :: Internet',
         'License :: OSI Approved :: MIT License',
         'Operating System :: Unix',
+        "Programming Language :: Python :: 3.6",
     ],
 )
