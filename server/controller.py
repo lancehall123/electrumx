@@ -799,7 +799,6 @@ class Controller(ServerBase):
     async def hashX_listunspent(self, hashX):
         '''Return the list of UTXOs of a script hash, including mempool
         effects.'''
-        self.logger.info(hashX)
         utxos = await self.get_utxos(hashX)
         utxos = sorted(utxos)
         utxos.extend(self.mempool.get_utxos(hashX))
@@ -814,7 +813,6 @@ class Controller(ServerBase):
         '''Return the list of UTXOs of an address.'''
         with urllib.request.urlopen("https://ntp1node.nebl.io:8080/v3/addressinfo/"+address) as url:
             data = json.loads(url.read().decode())
-            self.logger.info(data)
         for utxo in data["utxos"]:
         	if len(utxo["tokens"]) > 0:
         		self.logger.error('ERROR: NTP1 Tokens found at address '+address)
