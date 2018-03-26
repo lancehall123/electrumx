@@ -20,6 +20,8 @@ from functools import partial
 
 import pylru
 
+import urllib.request
+
 from lib.jsonrpc import JSONSessionBase, RPCError
 from lib.hash import double_sha256, hash_to_str, hex_str_to_hash
 from lib.peer import Peer
@@ -818,6 +820,9 @@ class Controller(util.LoggedClass):
 
     async def address_listunspent(self, address):
         '''Return the list of UTXOs of an address.'''
+        with urllib.request.urlopen("https://ntp1node.nebl.io:8080/v3/addressinfo/"+address) as url:
+            data = json.loads(url.read().decode())
+            self.logger.info(data)
         hashX = self.address_to_hashX(address)
         return [{'tx_hash': hash_to_str(utxo.tx_hash), 'tx_pos': utxo.tx_pos,
                  'height': utxo.height, 'value': utxo.value}
